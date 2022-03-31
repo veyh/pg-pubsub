@@ -34,9 +34,12 @@ export interface PgPubSubOptions extends ClientConfig {
      * Otherwise it is required to bypass correct options to instantiate
      * new `pg.Client` connection properly.
      *
+     * NOTE: `connect` can only be called once per client instance, so it's
+     * best to provide a factory function here.
+     *
      * @type {Client}
      */
-    pgClient?: Client;
+    pgClient?: Client | (() => Client);
 
     /**
      * Specifies delay in milliseconds between re-connection retries

@@ -290,13 +290,14 @@ export declare interface PgPubSub {
  */
 export class PgPubSub extends EventEmitter {
 
-    public readonly pgClient: PgClient;
+    public pgClient: PgClient;
     public readonly options: PgPubSubOptions;
     public readonly channels: PgChannelEmitter = new PgChannelEmitter();
 
     private locks: { [channel: string]: AnyLock } = {};
     private retry = 0;
     private processId: number;
+    private connectCalled: boolean;
 
     /**
      * @constructor
@@ -310,17 +311,43 @@ export class PgPubSub extends EventEmitter {
         super();
 
         this.options = { ...DefaultOptions, ...options };
-        this.pgClient = (this.options.pgClient || new Client(this.options)) as
-            PgClient;
-
-        this.pgClient.on('end', () => this.emit('end'));
-        this.pgClient.on('error', () => this.emit('error'));
 
         this.onNotification = this.onNotification.bind(this);
         this.reconnect = this.reconnect.bind(this);
         this.onReconnect = this.onReconnect.bind(this);
 
+        this.createClientAndRegisterEvents();
+    }
+
+    private createClientAndRegisterEvents() {
+        if (this.pgClient) {
+            this.pgClient.removeAllListeners();
+        }
+
+        this.connectCalled = false;
+        this.pgClient = this.createClient();
+
+        this.pgClient.on('end', () => {
+            this.emit('end');
+        });
+
+        this.pgClient.on('error', (err) => {
+            this.emit('error');
+        });
+
         this.pgClient.on('notification', this.onNotification);
+    }
+
+    private createClient(): PgClient {
+        if (typeof this.options.pgClient === 'function') {
+            return this.options.pgClient() as PgClient;
+        }
+
+        if (this.options.pgClient) {
+            return this.options.pgClient as PgClient;
+        }
+
+        return new Client(this.options) as PgClient;
     }
 
     /**
@@ -330,6 +357,8 @@ export class PgPubSub extends EventEmitter {
      */
     public async connect(): Promise<void> {
         return new Promise((resolve, reject) => {
+            this.connectCalled = true;
+
             const onConnect = async () => {
                 await this.setAppName();
                 await this.setProcessId();
@@ -353,7 +382,10 @@ export class PgPubSub extends EventEmitter {
             this.once('error', onError);
 
             // eslint-disable-next-line @typescript-eslint/no-floating-promises
-            this.pgClient.connect();
+            this.pgClient
+                .connect()
+                ?.catch
+                ?.(onError);
         });
     }
 
@@ -602,6 +634,7 @@ export class PgPubSub extends EventEmitter {
                 return this.close();
             }
 
+            this.createClientAndRegisterEvents();
             this.setOnceHandler(['connect'], this.onReconnect);
 
             try { await this.connect(); } catch (err) { /* ignore */ }

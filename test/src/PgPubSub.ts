@@ -20,14 +20,37 @@ import { Client } from 'pg';
 import * as sinon from 'sinon';
 import { PgClient, PgIpLock, PgPubSub, RETRY_LIMIT } from '../../src';
 
+function delay(valueMs: number): Promise<any> {
+    return new Promise((resolve) => {
+        setTimeout(resolve, valueMs);
+    });
+}
+
 describe('PgPubSub', () => {
     let pgClient: Client;
     let pubSub: PgPubSub;
+    let onCreateCallbacks: ((client: Client) => void)[] = [];
+
+    function createClient(...args: any) {
+        pgClient = new Client(...args);
+
+        for (const callback of onCreateCallbacks) {
+            callback(pgClient);
+        }
+
+        return pgClient;
+    }
+
+    function hookCreate(callback: any) {
+        callback(pgClient);
+        onCreateCallbacks.push(callback);
+    }
 
     beforeEach(() => {
-        pgClient = new Client();
-        pubSub = new PgPubSub({ pgClient });
+        onCreateCallbacks = [];
+        pubSub = new PgPubSub({ pgClient: createClient });
     });
+
     afterEach(async () => pubSub.destroy());
 
     it('should be a class', () => {
@@ -76,17 +99,27 @@ describe('PgPubSub', () => {
     });
     describe('reconnect', () => {
         it('should support automatic reconnect', done => {
-            let counter = 0;
+            let connectCallsTotal = 0;
 
-            // emulate termination
-            (pgClient as any).connect = () => {
-                counter++;
-                pgClient.emit('end');
-            };
+            hookCreate((client: Client) => {
+                let connectCalls = 0;
+
+                client.connect = () => {
+                    if (connectCalls++ > 0) {
+                        return Promise.reject(
+                            new Error('connect can only be called once')
+                        );
+                    }
+
+                    connectCallsTotal++;
+                    pgClient.emit('end');
+                    return Promise.resolve();
+                };
+            });
 
             pubSub.on('error', err => {
                 expect(err.message).equals(
-                    `Connect failed after ${counter} retries...`,
+                    `Connect failed after ${connectCallsTotal} retries...`,
                 );
                 done();
             });
@@ -94,38 +127,55 @@ describe('PgPubSub', () => {
             pubSub.connect().catch(() => { /**/ });
         });
         it('should fire connect event only once', done => {
-            let connectCalls = 0;
+            let connectCallsTotal = 0;
 
-            // emulate termination
-            (pgClient as any).connect = () => {
-                if (connectCalls < 1) {
-                    pgClient.emit('error');
-                }
+            hookCreate((client: Client) => {
+                let connectCalls = 0;
 
-                else {
-                    pgClient.emit('connect');
-                }
+                client.connect = () => {
+                    if (connectCalls++ > 0) {
+                        return Promise.reject(
+                            new Error('connect can only be called once')
+                        );
+                    }
 
-                connectCalls++;
-            };
+                   if (connectCallsTotal++ < 1) {
+                       pgClient.emit('error');
+                       return Promise.reject();
+                   }
+
+                   pgClient.emit('connect');
+                   return Promise.resolve();
+                };
+            });
 
             // test will fail if done is called more than once
             pubSub.on('connect', done);
             pubSub.connect().catch(() => { /**/ });
         });
         it('should support automatic reconnect on errors', done => {
-            let counter = 0;
+            let connectCallsTotal = 0;
 
-            // emulate termination
-            (pgClient as any).connect = () => {
-                counter++;
-                pgClient.emit('error');
-            };
+            hookCreate((client: Client) => {
+                let connectCalls = 0;
+
+                client.connect = () => {
+                    if (connectCalls++ > 0) {
+                        return Promise.reject(
+                            new Error('connect can only be called once')
+                        );
+                    }
+
+                    connectCallsTotal++;
+                    pgClient.emit('error');
+                    return Promise.resolve();
+                };
+            });
 
             pubSub.on('error', err => {
                 if (err) {
                     expect(err.message).equals(
-                        `Connect failed after ${counter} retries...`,
+                        `Connect failed after ${connectCallsTotal} retries...`,
                     );
                     done();
                 }
@@ -134,10 +184,20 @@ describe('PgPubSub', () => {
             pubSub.connect().catch(() => { /* ignore faking errors */ });
         });
         it('should emit error and end if retry limit reached', async () => {
-            // emulate connection failure
-            (pgClient as any).connect = async () => {
-                pgClient.emit('end');
-            };
+            hookCreate((client: Client) => {
+                let connectCalls = 0;
+
+                client.connect = () => {
+                    if (connectCalls++ > 0) {
+                        return Promise.reject(
+                            new Error('connect can only be called once')
+                        );
+                    }
+
+                    pgClient.emit('end');
+                    return Promise.resolve();
+                };
+            });
 
             try { await pubSub.connect(); } catch (err) {
                 expect(err).to.be.instanceOf(Error);
@@ -146,18 +206,17 @@ describe('PgPubSub', () => {
                 );
             }
         });
-        it('should re-subscribe all channels', done => {
-            pubSub.listen('TestOne');
-            pubSub.listen('TestTwo');
+        it('should re-subscribe all channels', async () => {
+            void pubSub.listen('TestOne');
+            void pubSub.listen('TestTwo');
 
             const spy = sinon.spy(pubSub, 'listen');
 
-            pubSub.connect().then(() => pgClient.emit('end'));
+            await pubSub.connect();
+            pgClient.emit('end');
 
-            setTimeout(() => {
-                expect(spy.calledTwice).to.be.true;
-                done();
-            }, 30);
+            await delay(30);
+            expect(spy.calledTwice).to.be.true;
         });
     });
     describe('close()', () => {
@@ -166,7 +225,7 @@ describe('PgPubSub', () => {
 
             pubSub.on('connect', () => {
                 counter++;
-                pubSub.close();
+                void pubSub.close();
             });
 
             await pubSub.connect();
@@ -192,7 +251,7 @@ describe('PgPubSub', () => {
         it('should handle messages from db with acquired lock', done => {
             pubSub.options.singleListener = true;
 
-            pubSub.listen('TestChannel').then(() => {
+            void pubSub.listen('TestChannel').then(() => {
                 pgClient.emit('notification', {
                     channel: 'TestChannel',
                     payload: 'true',
@@ -230,7 +289,8 @@ describe('PgPubSub', () => {
             const channel = `__${PgIpLock.name}__:TestChannel`;
 
             await pubSub.listen('TestChannel');
-            await pgClient.emit('notification', {
+
+            pgClient.emit('notification', {
                 channel,
                 payload: 'true',
             });
@@ -285,6 +345,8 @@ describe('PgPubSub', () => {
             const spy = sinon.spy(pubSub.pgClient, 'query');
             await pubSub.notify('Test', { a: 'b' });
             const [{ args: [arg, ] }] = spy.getCalls();
+
+            // eslint-disable-next-line @typescript-eslint/quotes
             expect(arg.trim()).equals(`NOTIFY "Test", '{"a":"b"}'`);
         });
     });
